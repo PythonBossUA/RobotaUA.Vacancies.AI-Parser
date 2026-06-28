@@ -12,9 +12,13 @@ Tech Market Demand Analyzer - scrapes job boards (currently robota.ua via GraphQ
 ```bash
 # 1. Scrape job data (5-15 minutes, creates scraped_data.csv)
 python scraper.py
+# OR using the modular version:
+python -m scraper
 
 # 2. Analyze and visualize (creates analytics_results/ folder)
 python analytics.py
+# OR using the modular version:
+python -m analytics
 ```
 
 ### Setup
@@ -39,31 +43,59 @@ cp .env.sample .env
 
 ## Architecture
 
+### Modular Structure
+
+The project is organized into two main modules with clear separation of concerns:
+
+```
+ScraperAnalytics/
+├── config.py                    # Shared configuration
+├── scraper.py                   # Legacy entry point (deprecated)
+├── analytics.py                 # Legacy entry point (deprecated)
+│
+├── scraper/                     # Scraping module
+│   ├── __init__.py
+│   ├── main.py                  # Orchestration & entry point
+│   ├── api_client.py            # GraphQL API interactions
+│   ├── ai_extractor.py          # AI-powered tech extraction
+│   ├── rate_limiter.py          # Token bucket rate limiting
+│   ├── text_processor.py        # HTML cleaning & normalization
+│   └── data_writer.py           # CSV writing & data cleaning
+│
+└── analytics/                   # Analytics module
+    ├── __init__.py
+    ├── main.py                  # Orchestration & entry point
+    ├── data_loader.py           # CSV loading & validation
+    ├── data_cleaner.py          # Data cleaning & preprocessing
+    ├── visualizations.py        # Chart generation (matplotlib/seaborn)
+    └── reports.py               # Report generation & data export
+```
+
 ### Two-Stage Pipeline (Strict SRP)
 
-**Stage 1: Scraping (scraper.py) - ASYNC**
+**Stage 1: Scraping (scraper/) - ASYNC**
 - GraphQL API → Raw vacancy data → AI extraction → CSV output
-- Uses `asyncio` + `aiohttp` for concurrent requests with rate limiting
+- Uses `asyncio` + `curl_cffi` for concurrent requests with rate limiting
 - Modules communicate ONLY via `scraped_data.csv` file
-- No direct imports between scraper.py and analytics.py
+- No direct imports between scraper/ and analytics/
 
-**Stage 2: Analytics (analytics.py)**
+**Stage 2: Analytics (analytics/)**
 - CSV input → Cleaning → Frequency analysis → 4 visualizations + reports
 
 ### Data Flow
 ```
 robota.ua GraphQL API
-    ↓ (scraper.py: pagination loop)
+    ↓ (api_client.py: pagination loop)
 List of vacancy IDs
-    ↓ (scraper.py: detail requests with 0.5s delay)
+    ↓ (api_client.py: detail requests with 0.2s rate limit)
 Full job descriptions (HTML)
-    ↓ (scraper.py: BeautifulSoup cleaning)
+    ↓ (text_processor.py: BeautifulSoup cleaning)
 Plain text descriptions
-    ↓ (scraper.py: chunked AI processing via OpenRouter)
+    ↓ (ai_extractor.py: chunked AI processing via OpenRouter)
 Technology lists per vacancy
-    ↓ (scraper.py: CSV writer)
+    ↓ (data_writer.py: CSV writer)
 scraped_data.csv [id, title, description, salary, company, city, stack]
-    ↓ (analytics.py: pandas pipeline)
+    ↓ (data_loader.py + data_cleaner.py: pandas pipeline)
 analytics_results/ [4 PNGs + TXT report + JSON + cleaned CSV]
 ```
 
@@ -97,31 +129,55 @@ Environment variables in `.env`:
 
 ## Module Interfaces
 
-### scraper.py exports nothing (runs as script)
-Entry point: `scraping()` → `scraping_async()` (async wrapper)
-Side effects: Creates/overwrites `scraped_data.csv`
+### scraper/ package
 
-Key async functions:
-- `scraping_async()` - Main async orchestration loop
-- `get_base_request()` - Fetches page of vacancies from GraphQL (sequential)
-- `get_vacancy_description()` - Fetches single vacancy detail (concurrent via semaphore)
-- `get_vacancies_stack()` - AI extraction with chunking and retry logic (concurrent)
-- `get_vacancies_stack_chunk()` - Process one AI chunk with rate limiting
-- `clean_vacancy_text()` - BeautifulSoup HTML→text cleanup (sync)
+**Entry point:** `scraper.main.scraping()` → `scraping_async()` (async wrapper)
+**Side effects:** Creates/overwrites `scraped_data.csv`
 
-Key classes:
-- `RateLimiter` - Token bucket implementation for minimum delay between requests
+**Submodules:**
 
-### analytics.py exports nothing (runs as script)
-Entry point: `run_full_analysis()` function at bottom
-Side effects: Creates `analytics_results/` directory with 7 files
+- `api_client.py` - GraphQL API interactions
+  - `get_base_request(session, page)` - Fetch page of vacancies (sequential)
+  - `get_vacancy_description(session, vacancy_id, semaphore, rate_limiter)` - Fetch single vacancy detail (concurrent)
+  
+- `ai_extractor.py` - AI-powered technology extraction
+  - `get_vacancies_stack(session, descriptions)` - Main AI extraction orchestrator
+  - `get_vacancies_stack_chunk(session, chunk, chunk_idx, semaphore, rate_limiter)` - Process one AI chunk with retry logic
+  
+- `rate_limiter.py` - Rate limiting
+  - `RateLimiter` class - Token bucket implementation for minimum delay between requests
+  
+- `text_processor.py` - HTML/text cleaning
+  - `clean_vacancy_text(html_text)` - BeautifulSoup HTML→text cleanup (sync)
+  
+- `data_writer.py` - CSV writing
+  - `write_csv(data, path)` - Append data to CSV with headers
+  - `clean_data(raw_data)` - Normalize data structures in-place
 
-Key functions:
-- `load_data()` - CSV validation and pandas loading
-- `clean_stack_data()` - Parse string "[...]" to actual lists
-- `extract_all_technologies()` - Counter across all vacancies
-- `create_technology_categories()` - Hardcoded grouping (Languages/Frameworks/Databases/Cloud/Data/Tools)
-- Four `visualize_*()` functions - matplotlib/seaborn charts at 300 DPI
+### analytics/ package
+
+**Entry point:** `analytics.main.run_full_analysis()` function
+**Side effects:** Creates `analytics_results/` directory with 7 files
+
+**Submodules:**
+
+- `data_loader.py` - CSV loading
+  - `load_data(csv_path)` - CSV validation and pandas loading
+  
+- `data_cleaner.py` - Data preprocessing
+  - `clean_stack_data(df)` - Parse string "[...]" to actual lists
+  - `extract_all_technologies(df)` - Counter across all vacancies
+  - `create_technology_categories(tech_counter)` - Hardcoded grouping (Languages/Frameworks/Databases/Cloud/Data/Tools)
+  
+- `visualizations.py` - Chart generation
+  - `visualize_top_technologies(tech_counter, top_n)` - Bar chart of top technologies
+  - `visualize_technology_distribution(df)` - Distribution histogram
+  - `analyze_salary_by_stack(df, tech_counter, top_n)` - Salary analysis chart
+  - `visualize_technology_categories(categorized)` - Pie chart by category
+  
+- `reports.py` - Report generation
+  - `generate_statistics_report(df, tech_counter)` - Text report with statistics
+  - `save_processed_data(df, tech_counter)` - Export to JSON/CSV
 
 ### config.py exports constants only
 No functions, just module-level variables
@@ -147,4 +203,14 @@ Uses `os.environ['OPENROUTER_API_KEY']` from dotenv
 
 **Matplotlib threading:** Analytics creates/closes figures explicitly (`plt.close()`) to avoid memory leaks when generating multiple charts.
 
-**GraphQL payload structure:** `LIST_PAYLOAD` and `DETAIL_PAYLOAD` in scraper.py are fragile - robota.ua may change schema. If scraping breaks, check GraphQL operation names and field structure first.
+**GraphQL payload structure:** `LIST_PAYLOAD` and `DETAIL_PAYLOAD_TEMPLATE` in `api_client.py` are fragile - robota.ua may change schema. If scraping breaks, check GraphQL operation names and field structure first.
+
+**Modular design:** Each submodule has a single responsibility. When modifying functionality:
+- API changes → `api_client.py`
+- Rate limiting tuning → `rate_limiter.py`
+- AI prompt/parsing → `ai_extractor.py`
+- HTML cleaning → `text_processor.py`
+- Visualization style → `visualizations.py`
+- Report format → `reports.py`
+
+**Backwards compatibility:** Root-level `scraper.py` and `analytics.py` are deprecated wrappers that import from the modular versions. New code should use `python -m scraper.main` or `from scraper import scraping`.

@@ -20,16 +20,37 @@ Understand **which technologies** are most in-demand in the job market right now
 
 ## ⚙️ Architecture
 
-The project consists of **three independent modules**:
+The project consists of **two main modules** with clear separation of concerns:
 
 ```
 ScraperAnalytics/
 │
-├── config.py          # Scraping and API configuration parameters
-├── scraper.py         # Data collection module from job portals
-├── analytics.py       # Data analysis and visualization module
-├── scraped_data.csv   # Raw data (created after running scraper.py)
-└── analytics_results/ # Analysis results (created after running analytics.py)
+├── config.py                    # Shared configuration parameters
+├── .env                         # API keys (not in git)
+├── requirements.txt             # Python dependencies
+│
+├── scraper.py                   # Legacy entry point (deprecated)
+├── analytics.py                 # Legacy entry point (deprecated)
+│
+├── scraper/                     # 📥 Data collection module
+│   ├── __init__.py
+│   ├── main.py                  # Main orchestration & entry point
+│   ├── api_client.py            # GraphQL API client for robota.ua
+│   ├── ai_extractor.py          # AI-powered technology extraction
+│   ├── rate_limiter.py          # Token bucket rate limiting
+│   ├── text_processor.py        # HTML cleaning & text normalization
+│   └── data_writer.py           # CSV writing & data cleaning
+│
+├── analytics/                   # 📊 Data analysis module
+│   ├── __init__.py
+│   ├── main.py                  # Main orchestration & entry point
+│   ├── data_loader.py           # CSV loading & validation
+│   ├── data_cleaner.py          # Data preprocessing & cleaning
+│   ├── visualizations.py        # Chart generation (4 visualizations)
+│   └── reports.py               # Report generation & data export
+│
+├── scraped_data.csv             # Raw data (created by scraper/)
+└── analytics_results/           # Analysis output (created by analytics/)
     ├── top_technologies.png
     ├── tech_distribution.png
     ├── salary_by_tech.png
@@ -38,6 +59,24 @@ ScraperAnalytics/
     ├── cleaned_data.csv
     └── technology_frequencies.json
 ```
+
+### Modular Design Principles
+
+**Scraper Module (`scraper/`):**
+- **Single Responsibility:** Each file handles one specific concern
+- **Async-First:** All network I/O uses `asyncio` for 3-5x faster performance
+- **Rate Limited:** Token bucket pattern prevents server overload
+- **Resilient:** Retry logic with exponential backoff
+
+**Analytics Module (`analytics/`):**
+- **Separation of Concerns:** Data loading → Cleaning → Visualization → Reporting
+- **Pure Functions:** Each function has clear inputs/outputs
+- **Reusable Components:** Visualizations can be generated independently
+
+**Communication Contract:**
+- Modules communicate ONLY via `scraped_data.csv` file
+- No direct imports between `scraper/` and `analytics/`
+- CSV schema is the interface contract
 
 ---
 
@@ -70,12 +109,16 @@ Get your API key at [OpenRouter.ai](https://openrouter.ai/)
 ### 3. Run the Scraper
 
 ```bash
+# New modular way (recommended)
+python -m scraper
+
+# Or legacy way (still works)
 python scraper.py
 ```
 
 **What happens:**
 - Connects to robota.ua API via GraphQL
-- Collects information about Python vacancies
+- Collects information about Python vacancies (configurable in `config.py`)
 - **Async processing:** Fetches multiple vacancy descriptions concurrently (up to 5 at once)
 - Uses AI (via OpenRouter) to extract technologies from descriptions
 - Saves results to `scraped_data.csv`
@@ -85,6 +128,10 @@ python scraper.py
 ### 4. Run the Analysis
 
 ```bash
+# New modular way (recommended)
+python -m analytics
+
+# Or legacy way (still works)
 python analytics.py
 ```
 
@@ -113,6 +160,8 @@ python analytics.py
 | `REQUEST_TIMEOUT` | Request timeout (sec) | `30` |
 | `CSV_FILENAME` | Output CSV filename | `"scraped_data.csv"` |
 | `REQUEST_CHUNK` | Chunk size for AI processing | `10` |
+| `MAX_CONCURRENT_DETAILS` | Max concurrent detail requests | `5` |
+| `MAX_CONCURRENT_AI_REQUESTS` | Max concurrent AI requests | `3` |
 
 ### API Endpoints
 
@@ -135,40 +184,58 @@ MODEL = "openai/gpt-oss-120b:free"  # Free OpenRouter model
 
 ---
 
-## 🕷️ Scraper Module (`scraper.py`)
+## 🕷️ Scraper Module (`scraper/`)
 
-### Main Functions
+### Module Structure
 
-#### `scraping()`
+#### `main.py` - Orchestration
 Main function that launches the data collection process.
 
 **Algorithm:**
-1. Creates a session with browser impersonation (curl_cffi)
-2. Makes API request to get vacancy list
-3. For each vacancy, loads full description
+1. Creates async session with browser impersonation (curl_cffi)
+2. Makes API request to get vacancy list (paginated)
+3. For each page, loads all vacancy descriptions concurrently (max 5 at once)
 4. Groups descriptions into chunks of 10
-5. Sends chunks to AI for technology extraction
+5. Sends chunks to AI for technology extraction (max 3 concurrent)
 6. Saves results to CSV
-7. Proceeds to next page with delay
+7. Proceeds to next page with 2s delay
 
-#### `get_vacancy_description(session: Session) -> Optional[str]`
-Gets full vacancy description by ID.
+#### `api_client.py` - GraphQL Client
+Handles all HTTP interactions with robota.ua.
+
+**Key Functions:**
+- `get_base_request(session, page)` - Fetch list of vacancies for a page
+- `get_vacancy_description(session, vacancy_id, semaphore, rate_limiter)` - Fetch single vacancy detail with concurrency control
 
 **Features:**
 - Automatic retry on errors (up to 3 attempts)
 - Timeout protection (30 seconds)
+- Browser impersonation to bypass Cloudflare
 - Logging of all errors
 
-#### `get_vacancies_stack(session: Session, descriptions: dict) -> dict`
+#### `ai_extractor.py` - Technology Extraction
 Uses AI to extract technologies from vacancy descriptions.
 
-**Features:**
-- Chunk processing to optimize API requests
-- Special handling for HTTP 429 (Rate Limit) - infinite retries
-- Fallback to empty list on errors
-- JSON parsing from AI free text
+**Key Functions:**
+- `get_vacancies_stack(session, descriptions)` - Main orchestrator
+- `get_vacancies_stack_chunk(session, chunk, chunk_idx, semaphore, rate_limiter)` - Process one chunk
 
-#### `clean_vacancy_text(html_text: str) -> str`
+**Features:**
+- Chunk processing (10 vacancies per request) to optimize API usage
+- Special handling for HTTP 429 (Rate Limit) - infinite retries with backoff
+- Fallback to empty list `[]` on parse errors
+- JSON extraction from AI free text using substring search
+
+#### `rate_limiter.py` - Rate Limiting
+Token bucket pattern implementation for async requests.
+
+**RateLimiter Class:**
+```python
+rate_limiter = RateLimiter(0.2)  # Min 0.2s between requests
+await rate_limiter.acquire()  # Wait if needed
+```
+
+#### `text_processor.py` - Text Cleaning
 Cleans HTML from tags and formats text.
 
 **Operations:**
@@ -177,22 +244,29 @@ Cleans HTML from tags and formats text.
 - URL removal
 - Whitespace normalization
 
+#### `data_writer.py` - CSV Operations
+Writes data to CSV and normalizes data structures.
+
+**Functions:**
+- `write_csv(data, path)` - Append data with headers
+- `clean_data(raw_data)` - Normalize nested structures (salary, company, city)
+
 ### Rate Limiting & Ethics
 
 **Server respect:**
 - ✅ 2-second delay between pages
-- ✅ 0.5-second delay between vacancy details
-- ✅ Maximum 3 retry attempts
+- ✅ 0.2-second minimum delay between vacancy details (max 5 req/sec)
+- ✅ 1.0-second minimum delay between AI requests
+- ✅ Maximum 3 retry attempts (except 429 rate limits)
 - ✅ Browser impersonation to reduce load
 - ✅ GraphQL instead of HTML scraping
 
 **429 (Rate Limit) handling:**
 ```python
 elif ai_res.status_code == 429:
-    logger.warning(f"Rate limited (429), waiting before retry")
-    time.sleep(min(0.5, config.RETRY_DELAY))
-    attempt -= 1  # Don't count this attempt
-    continue  # Infinite retry
+    logger.warning(f"Rate limited (429), waiting 2s before retry")
+    await asyncio.sleep(2.0)
+    continue  # Infinite retry for rate limits
 ```
 
 ### Output Data (CSV)
@@ -207,7 +281,7 @@ elif ai_res.status_code == 429:
 | `salary` | int/null | Salary (if specified) |
 | `company` | str | Company name |
 | `city` | str | City |
-| `stack` | list[str] | Technology list (JSON) |
+| `stack` | list[str] | Technology list (JSON-encoded) |
 
 **Example entry:**
 ```csv
@@ -217,24 +291,43 @@ id,title,description,salary,company,city,stack
 
 ---
 
-## 📊 Analytics Module (`analytics.py`)
+## 📊 Analytics Module (`analytics/`)
 
-### Main Functions
+### Module Structure
 
-#### `run_full_analysis()`
+#### `main.py` - Orchestration
 Runs the full analysis pipeline:
-1. Data loading
-2. Cleaning and validation
+1. Data loading (`data_loader.py`)
+2. Cleaning and validation (`data_cleaner.py`)
 3. Technology extraction
-4. Visualization creation
-5. Report generation
+4. Visualization creation (`visualizations.py`)
+5. Report generation (`reports.py`)
 
-#### Data Analysis
+#### `data_loader.py` - Data Loading
+**`load_data(csv_path)`** - CSV loading with validation
+- Checks file existence
+- Validates required columns (id, title, stack)
+- Returns pandas DataFrame or None
 
-**`load_data()`** - CSV loading with validation  
-**`clean_stack_data()`** - parse stack column from string to list  
-**`extract_all_technologies()`** - count frequency of all technologies  
-**`create_technology_categories()`** - categorize by type
+#### `data_cleaner.py` - Data Preprocessing
+**Functions:**
+- `clean_stack_data(df)` - Parse stack column from string "[...]" to actual list
+- `extract_all_technologies(df)` - Count frequency of all technologies across vacancies
+- `create_technology_categories(tech_counter)` - Categorize technologies by type (Languages, Frameworks, Databases, etc.)
+
+#### `visualizations.py` - Chart Generation
+Creates 4 professional visualizations at 300 DPI.
+
+**Functions:**
+- `visualize_top_technologies(tech_counter, top_n)` - Bar chart
+- `visualize_technology_distribution(df)` - Histogram
+- `analyze_salary_by_stack(df, tech_counter, top_n)` - Salary analysis
+- `visualize_technology_categories(categorized)` - Pie chart
+
+#### `reports.py` - Report Generation
+**Functions:**
+- `generate_statistics_report(df, tech_counter)` - Text report with detailed statistics
+- `save_processed_data(df, tech_counter)` - Export to JSON and cleaned CSV
 
 ### Visualizations
 
@@ -250,7 +343,7 @@ Horizontal bar chart of top-20 technologies by vacancy count.
 Distribution of number of technologies per vacancy.
 
 **What it shows:**
-- Typical stack size for Python developers
+- Typical stack size for developers
 - Requirement variance (from minimalists to full-stack)
 
 #### 3. Salary by Tech (`salary_by_tech.png`)
@@ -444,7 +537,7 @@ echo "OPENROUTER_API_KEY=your_key" > .env
 ### Error: `scraped_data.csv not found`
 
 **Solution:**
-- First run `scraper.py`
+- First run `python -m scraper.main` or `python scraper.py`
 - Verify that scraping completed successfully
 
 ### Empty charts / No data
@@ -452,15 +545,25 @@ echo "OPENROUTER_API_KEY=your_key" > .env
 **Solution:**
 - Check that CSV has `stack` column
 - Ensure AI correctly extracted technologies
-- Check `scraper.py` logs for errors
+- Check scraper logs for errors
+
+### ModuleNotFoundError: No module named 'scraper'
+
+**Solution:**
+- Make sure you're running from the project root directory
+- The `scraper/` and `analytics/` directories must contain `__init__.py` files
 
 ---
 
 ## 🔮 Roadmap
 
-### Planned Improvements
+### Completed
+- ✅ Asynchronous scraping (`asyncio` + `curl_cffi`)
+- ✅ Modular architecture with clear separation of concerns
+- ✅ Token bucket rate limiting
+- ✅ Comprehensive error handling and retry logic
 
-- [ ] Asynchronous scraping (`asyncio` + `aiohttp`)
+### Planned Improvements
 - [ ] Support for multiple job portals (dou.ua, work.ua)
 - [ ] NLP for automatic discovery of new technologies
 - [ ] Correlation analysis (experience vs salary vs technologies)
@@ -499,7 +602,7 @@ Questions and suggestions are welcome in Issues.
 
 **Last Updated:** June 28, 2026
 
-**Version:** 1.0.0
+**Version:** 2.0.0 (Modular Architecture)
 
 **Python:** 3.11+
 
