@@ -83,3 +83,7 @@ IMPORTANT:
 JOB DESCRIPTIONS:
 """
 MODEL = "openai/gpt-oss-120b:free"
+
+# Async settings
+MAX_CONCURRENT_DETAILS = 5
+MAX_CONCURRENT_AI_REQUESTS = 3

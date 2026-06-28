@@ -50,7 +50,7 @@ pip install -r requirements.txt
 ```
 
 **Required libraries:**
-- `curl_cffi` - Cloudflare protection bypass
+- `curl-cffi` - Cloudflare protection bypass with async support
 - `beautifulsoup4` - HTML parsing
 - `pandas` - data processing
 - `matplotlib` - visualization
@@ -76,11 +76,11 @@ python scraper.py
 **What happens:**
 - Connects to robota.ua API via GraphQL
 - Collects information about Python vacancies
-- For each vacancy, loads the full description
+- **Async processing:** Fetches multiple vacancy descriptions concurrently (up to 5 at once)
 - Uses AI (via OpenRouter) to extract technologies from descriptions
 - Saves results to `scraped_data.csv`
 
-**Execution time:** ~5-15 minutes depending on the number of vacancies
+**Execution time:** ~2-5 minutes depending on the number of vacancies (3-5x faster than sync version)
 
 ### 4. Run the Analysis
 

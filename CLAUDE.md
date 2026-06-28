@@ -41,8 +41,9 @@ cp .env.sample .env
 
 ### Two-Stage Pipeline (Strict SRP)
 
-**Stage 1: Scraping (scraper.py)**
+**Stage 1: Scraping (scraper.py) - ASYNC**
 - GraphQL API → Raw vacancy data → AI extraction → CSV output
+- Uses `asyncio` + `aiohttp` for concurrent requests with rate limiting
 - Modules communicate ONLY via `scraped_data.csv` file
 - No direct imports between scraper.py and analytics.py
 
@@ -68,14 +69,16 @@ analytics_results/ [4 PNGs + TXT report + JSON + cleaned CSV]
 
 ### Key Technical Decisions
 
-**Cloudflare Bypass:** Uses `curl_cffi` with Chrome browser impersonation instead of requests/selenium. GraphQL API is more stable than HTML scraping.
+**Async Architecture:** Uses `asyncio` + `curl_cffi.requests.AsyncSession` for 3-5x faster scraping through concurrent requests with browser impersonation. Semaphores limit concurrent connections (5 detail requests, 3 AI requests) to respect server load.
 
 **AI Tech Extraction:** OpenRouter API processes 10 job descriptions per request (chunked). Prompt in `config.ZERO_PROMPT` instructs model to return JSON dictionary `{"vacancy_id": ["TECH1", "TECH2"]}`. Parsing uses substring extraction (`find("{")`/`rfind("}")`) because AI may add text outside JSON.
 
-**Rate Limiting Strategy:**
-- 2.0s between page requests (pagination)
-- 0.5s between detail requests (within page)
-- HTTP 429 triggers infinite retry with backoff (doesn't count against MAX_RETRIES)
+**Rate Limiting Strategy (Token Bucket Pattern):**
+- 2.0s between page requests (pagination) - sequential
+- 0.2s minimum between detail requests (5 req/sec max) - concurrent with semaphore
+- 1.0s minimum between AI requests - concurrent with semaphore
+- `asyncio.Semaphore` limits: 5 concurrent detail requests, 3 concurrent AI requests
+- HTTP 429 triggers retry with 2s backoff (doesn't count against MAX_RETRIES)
 - All other errors: max 3 retries then fail gracefully
 
 **CSV as Contract:** Column order matters for analytics compatibility: `id, title, description, salary, company, city, stack`. Stack column contains JSON-encoded list as string (parsed in analytics with `json.loads()`).
@@ -95,14 +98,19 @@ Environment variables in `.env`:
 ## Module Interfaces
 
 ### scraper.py exports nothing (runs as script)
-Entry point: `scraping()` function at bottom
+Entry point: `scraping()` → `scraping_async()` (async wrapper)
 Side effects: Creates/overwrites `scraped_data.csv`
 
-Key functions:
-- `get_base_request()` - Fetches page of vacancies from GraphQL
-- `get_vacancy_description()` - Fetches single vacancy detail
-- `get_vacancies_stack()` - AI extraction with chunking and retry logic
-- `clean_vacancy_text()` - BeautifulSoup HTML→text cleanup
+Key async functions:
+- `scraping_async()` - Main async orchestration loop
+- `get_base_request()` - Fetches page of vacancies from GraphQL (sequential)
+- `get_vacancy_description()` - Fetches single vacancy detail (concurrent via semaphore)
+- `get_vacancies_stack()` - AI extraction with chunking and retry logic (concurrent)
+- `get_vacancies_stack_chunk()` - Process one AI chunk with rate limiting
+- `clean_vacancy_text()` - BeautifulSoup HTML→text cleanup (sync)
+
+Key classes:
+- `RateLimiter` - Token bucket implementation for minimum delay between requests
 
 ### analytics.py exports nothing (runs as script)
 Entry point: `run_full_analysis()` function at bottom
@@ -127,11 +135,11 @@ Uses `os.environ['OPENROUTER_API_KEY']` from dotenv
 
 **Single Data Source:** Only robota.ua implemented. Adding dou.ua/work.ua requires new GraphQL schema and possibly different Cloudflare bypass technique.
 
-**No Async:** Sequential requests. Could be 3-5x faster with asyncio but requires rewriting `curl_cffi.Session` to async alternative.
+**Async Concurrency Limits:** Hardcoded to 5 detail / 3 AI concurrent requests. May need tuning based on server response times and rate limit policies.
 
 ## Critical Implementation Notes
 
-**DO NOT use `requests` library** - Will not bypass Cloudflare. Must use `curl_cffi` with `impersonate="chrome"`.
+**Async architecture:** All network I/O uses `curl_cffi.requests.AsyncSession` with `asyncio` and Chrome browser impersonation. Concurrency controlled via `asyncio.Semaphore`. Rate limiting via custom `RateLimiter` class (token bucket pattern).
 
 **AI prompt modification:** If changing `ZERO_PROMPT`, ensure response format stays as JSON dict with string keys. Analytics expects `stack` column to be parseable as list.
 

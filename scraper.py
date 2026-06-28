@@ -1,4 +1,5 @@
-from curl_cffi import Session
+import asyncio
+from curl_cffi.requests import AsyncSession
 from pathlib import Path
 from itertools import batched
 import re
@@ -22,6 +23,7 @@ HEADERS = {
     "referer": config.REFERER,
     "content-type": "application/json",
 }
+
 LIST_PAYLOAD = {
     "operationName": "getPublishedVacanciesList",
     "variables": {
@@ -80,7 +82,8 @@ LIST_PAYLOAD = {
     }
     """,
 }
-DETAIL_PAYLOAD = {
+
+DETAIL_PAYLOAD_TEMPLATE = {
     "operationName": "getPublishedVacancy",
     "variables": {
         "id": None,
@@ -98,56 +101,136 @@ fragment PublishedVacancyPage on Vacancy {
   __typename
 }"""
 }
+
 BASE_URL = config.BASE_URL
 BASE_DETAIL_URL = config.BASE_DETAIL_URL
 CSV_NAME = config.CSV_FILENAME
 
-
-def get_next_payload() -> None:
-    """Increment page number in payload."""
-    LIST_PAYLOAD["variables"]["pagination"]["page"] += 1
-
-
-def inject_vacancy_id_in_payload(vacancy_id: str) -> None:
-    DETAIL_PAYLOAD["variables"]["id"] = vacancy_id
+# Concurrency control - max concurrent detail requests
+MAX_CONCURRENT_DETAILS = config.MAX_CONCURRENT_DETAILS  # Respectful to server - not too many parallel connections
+MAX_CONCURRENT_AI_REQUESTS = config.MAX_CONCURRENT_AI_REQUESTS  # Limit AI API concurrent requests
 
 
-def get_vacancy_description(session: Session) -> Optional[str]:
-    for attempt in range(config.MAX_RETRIES):
-        try:
-            res = session.post(
-                BASE_DETAIL_URL,
-                headers=HEADERS,
-                json=DETAIL_PAYLOAD,
-                timeout=config.REQUEST_TIMEOUT
-            )
-            res.raise_for_status()
-            return res.json().get("data", {}).get("publishedVacancy", {}).get("fullDescription")
-        except Exception as e:
-            logger.warning(f"Failed to get vacancy description (attempt {attempt + 1}/{config.MAX_RETRIES}): {e}")
-            if attempt < config.MAX_RETRIES - 1:
-                time.sleep(config.RETRY_DELAY)
-            else:
-                logger.error("All retry attempts failed for vacancy description")
-                return None
+class RateLimiter:
+    """Token bucket rate limiter for async requests."""
+
+    def __init__(self, rate: float):
+        """
+        Args:
+            rate: Minimum seconds between requests
+        """
+        self.rate = rate
+        self.last_request = 0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        """Wait until we can make another request."""
+        async with self._lock:
+            now = time.time()
+            time_since_last = now - self.last_request
+
+            if time_since_last < self.rate:
+                sleep_time = self.rate - time_since_last
+                await asyncio.sleep(sleep_time)
+
+            self.last_request = time.time()
+
+
+def get_next_payload(page: int) -> dict:
+    """Create payload for specific page number."""
+    payload = LIST_PAYLOAD.copy()
+    payload["variables"] = payload["variables"].copy()
+    payload["variables"]["pagination"] = payload["variables"]["pagination"].copy()
+    payload["variables"]["pagination"]["page"] = page
+    return payload
+
+
+def create_detail_payload(vacancy_id: str) -> dict:
+    """Create payload for specific vacancy detail."""
+    payload = DETAIL_PAYLOAD_TEMPLATE.copy()
+    payload["variables"] = payload["variables"].copy()
+    payload["variables"]["id"] = vacancy_id
+    return payload
 
 
 def clean_vacancy_text(html_text: str) -> str:
+    """Clean HTML and normalize text."""
     soup = BeautifulSoup(html_text, "html.parser")
     text = soup.get_text(separator=" ")
 
-    text = text.replace(' ', ' ').replace('\t', ' ')
+    text = text.replace(' ', ' ').replace('\t', ' ')
     text = re.sub(r'(\w)\?(\w)', r"\1'\2", text)
     text = re.sub(r'https?://\S+', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 
-# AI Integration
-def get_vacancies_stack(session: Session, descriptions: dict[str, str]) -> dict[str, list[str]]:
-    stack = {}
+async def get_vacancy_description(
+    session: AsyncSession,
+    vacancy_id: str,
+    semaphore: asyncio.Semaphore,
+    rate_limiter: RateLimiter
+) -> tuple[str, Optional[str]]:
+    """
+    Fetch single vacancy description with concurrency control.
 
-    for chunk_idx, chunk in enumerate(batched(descriptions.items(), config.REQUEST_CHUNK), 1):
+    Returns:
+        Tuple of (vacancy_id, description or None)
+    """
+    async with semaphore:  # Limit concurrent connections
+        await rate_limiter.acquire()  # Rate limiting
+
+        payload = create_detail_payload(vacancy_id)
+
+        for attempt in range(config.MAX_RETRIES):
+            try:
+                response = await session.post(
+                    BASE_DETAIL_URL,
+                    headers=HEADERS,
+                    json=payload,
+                    timeout=config.REQUEST_TIMEOUT
+                )
+                response.raise_for_status()
+                data = response.json()
+                description = data.get("data", {}).get("publishedVacancy", {}).get("fullDescription")
+
+                if description:
+                    logger.info(f"✓ Fetched description for vacancy {vacancy_id}")
+                    return vacancy_id, description
+                else:
+                    logger.warning(f"Empty description for vacancy {vacancy_id}")
+                    return vacancy_id, ""
+
+            except Exception as e:
+                logger.warning(f"Error fetching vacancy {vacancy_id} (attempt {attempt + 1}/{config.MAX_RETRIES}): {e}")
+                if attempt < config.MAX_RETRIES - 1:
+                    await asyncio.sleep(config.RETRY_DELAY)
+
+        logger.error(f"Failed to fetch vacancy {vacancy_id} after {config.MAX_RETRIES} attempts")
+        return vacancy_id, None
+
+
+async def get_vacancies_stack_chunk(
+    session: AsyncSession,
+    chunk: list[tuple[str, str]],
+    chunk_idx: int,
+    semaphore: asyncio.Semaphore,
+    rate_limiter: RateLimiter
+) -> dict[str, list[str]]:
+    """
+    Process one chunk of vacancies with AI extraction.
+    Uses unlimited retries until successful.
+
+    Args:
+        chunk: List of (vacancy_id, description) tuples
+        chunk_idx: Chunk number for logging
+
+    Returns:
+        Dictionary mapping vacancy_id to list of technologies
+    """
+    async with semaphore:  # Limit concurrent AI requests
+        await rate_limiter.acquire()  # Rate limiting for AI API
+
         raw_vacancies = "\n".join([
             f"\n=== VACANCY ID: {id_} ===\n{description}"
             for id_, description in chunk
@@ -155,13 +238,12 @@ def get_vacancies_stack(session: Session, descriptions: dict[str, str]) -> dict[
         parsed_vacancies = clean_vacancy_text(raw_vacancies)
 
         attempt = 0
-        max_attempts = max(10, config.MAX_RETRIES)
-        success = False
 
-        while attempt < max_attempts and not success:
+        # Unlimited retries until success
+        while True:
             attempt += 1
             try:
-                ai_res = session.post(
+                ai_res = await session.post(
                     config.BASE_OPENROUTER_URL,
                     headers=config.OPENROUTER_HEADERS,
                     json={
@@ -177,49 +259,118 @@ def get_vacancies_stack(session: Session, descriptions: dict[str, str]) -> dict[
                 )
 
                 if ai_res.status_code == 200:
-                    ai_answer = ai_res.json()["choices"][0]["message"]["content"]
+                    ai_data = ai_res.json()
+                    ai_answer = ai_data["choices"][0]["message"]["content"]
+
+                    # Extract JSON from response
                     start = ai_answer.find("{")
                     end = ai_answer.rfind("}") + 1
 
                     if start == -1 or end == 0:
-                        logger.warning(f"AI response doesn't contain valid JSON (chunk {chunk_idx}, attempt {attempt}/{max_attempts})")
-                        time.sleep(min(0.5, config.RETRY_DELAY))
+                        logger.warning(f"AI response doesn't contain valid JSON (chunk {chunk_idx}, attempt {attempt})")
+                        await asyncio.sleep(0.5)
                         continue
 
                     data = json.loads(ai_answer[start:end])
-                    for key in data:
-                        stack[key] = [tech.upper() for tech in data[key]]
-                    logger.info(f"Successfully parsed chunk {chunk_idx}")
-                    success = True
+                    result = {key: [tech.upper() for tech in data[key]] for key in data}
+                    logger.info(f"✓ Successfully parsed AI chunk {chunk_idx} (after {attempt} attempt(s))")
+                    return result
 
                 elif ai_res.status_code == 429:
-                    # Rate limit - always retry with exponential backoff
-                    logger.warning(f"Rate limited (429) for chunk {chunk_idx}, waiting {retry_after}s before retry")
-                    time.sleep(min(0.5, config.RETRY_DELAY))
-                    # Don't increment attempt counter for rate limits - keep retrying
-                    attempt -= 1
+                    # Rate limit - wait longer and retry
+                    logger.warning(f"Rate limited (429) for AI chunk {chunk_idx}, waiting 2s before retry (attempt {attempt})")
+                    await asyncio.sleep(2.0)
                     continue
 
                 else:
-                    logger.warning(f"AI request failed with status {ai_res.status_code} (chunk {chunk_idx}, attempt {attempt}/{max_attempts})")
-                    time.sleep(min(0.5, config.RETRY_DELAY))
+                    logger.warning(f"AI request failed with status {ai_res.status_code} (chunk {chunk_idx}, attempt {attempt})")
+                    await asyncio.sleep(0.5)
+                    continue
 
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse AI JSON response (chunk {chunk_idx}, attempt {attempt}/{max_attempts}): {e}")
-                time.sleep(min(0.5, config.RETRY_DELAY))
+                logger.error(f"Failed to parse AI JSON (chunk {chunk_idx}, attempt {attempt}): {e}")
+                await asyncio.sleep(0.5)
+                continue
 
             except Exception as e:
-                logger.error(f"AI request error (chunk {chunk_idx}, attempt {attempt}/{max_attempts}): {e}")
-                time.sleep(min(0.5, config.RETRY_DELAY))
+                logger.error(f"AI request error (chunk {chunk_idx}, attempt {attempt}): {e}")
+                await asyncio.sleep(1.0)
+                continue
 
-        # If all attempts failed, return empty lists for this chunk
-        if not success:
-            logger.error(f"Failed to process chunk {chunk_idx} after {max_attempts} attempts")
-            for id_, _ in chunk:
-                stack[id_] = []
+
+async def get_vacancies_stack(
+    session: AsyncSession,
+    descriptions: dict[str, str]
+) -> dict[str, list[str]]:
+    """
+    Extract technology stacks from descriptions using AI (async with concurrency control).
+
+    Returns:
+        Dictionary mapping vacancy_id to list of technologies
+    """
+    stack = {}
+
+    # Create semaphore and rate limiter for AI requests
+    ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_REQUESTS)
+    ai_rate_limiter = RateLimiter(1.0)  # 1 second between AI requests
+
+    # Process chunks concurrently (but with limits)
+    chunks = list(batched(descriptions.items(), config.REQUEST_CHUNK))
+
+    tasks = [
+        get_vacancies_stack_chunk(session, list(chunk), idx, ai_semaphore, ai_rate_limiter)
+        for idx, chunk in enumerate(chunks, 1)
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Merge results
+    for result in results:
+        if isinstance(result, dict):
+            stack.update(result)
+        else:
+            logger.error(f"AI chunk processing error: {result}")
 
     return stack
 
+
+async def get_base_request(
+    session: AsyncSession,
+    page: int
+) -> Optional[list[dict]]:
+    """
+    Fetch list of vacancies for a given page.
+
+    Returns:
+        List of vacancy items or None if request failed.
+    """
+    payload = get_next_payload(page)
+
+    for attempt in range(config.MAX_RETRIES):
+        try:
+            response = await session.post(
+                BASE_URL,
+                headers=HEADERS,
+                json=payload,
+                timeout=config.REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            json_data = response.json()
+
+            if "errors" in json_data:
+                logger.warning(f"API returned errors: {json_data['errors']}")
+                return None
+
+            items = json_data.get("data", {}).get("publishedVacancies", {}).get("items")
+            return items
+
+        except Exception as e:
+            logger.warning(f"Request attempt {attempt + 1}/{config.MAX_RETRIES} failed for page {page}: {e}")
+            if attempt < config.MAX_RETRIES - 1:
+                await asyncio.sleep(config.RETRY_DELAY)
+            else:
+                logger.error(f"All retry attempts failed for page {page}")
+                return None
 
 
 def write_csv(data: list[dict], path: Path) -> None:
@@ -253,39 +404,8 @@ def clean_data(raw_data: list[dict[str, str]]) -> None:
         element.pop("__typename", None)
 
 
-def get_base_request(session: Session) -> Optional[list[dict]]:
-    """
-    Make request to API with retries and error handling.
-
-    Returns:
-        List of vacancy items or None if request failed.
-    """
-    for attempt in range(config.MAX_RETRIES):
-        try:
-            response = session.post(BASE_URL, headers=HEADERS, json=LIST_PAYLOAD, timeout=config.REQUEST_TIMEOUT)
-            response.raise_for_status()
-
-            json_data = response.json()
-
-            # Check if response contains errors
-            if "errors" in json_data:
-                logger.warning(f"API returned errors: {json_data['errors']}")
-                return None
-
-            # Extract items from response
-            return json_data.get("data", {}).get("publishedVacancies", {}).get("items")
-
-        except Exception as e:
-            logger.warning(f"Request attempt {attempt + 1}/{config.MAX_RETRIES} failed: {e}")
-            if attempt < config.MAX_RETRIES - 1:
-                time.sleep(config.RETRY_DELAY)
-            else:
-                logger.error(f"All retry attempts failed for page {LIST_PAYLOAD['variables']['pagination']['page']}")
-                return None
-
-
-def scraping() -> None:
-    """Main scraping function with proper error handling and rate limiting."""
+async def scraping_async() -> None:
+    """Main async scraping function with concurrency control and rate limiting."""
     path = Path(CSV_NAME)
 
     # Clear file for new data
@@ -296,21 +416,23 @@ def scraping() -> None:
         with open(CSV_NAME, "w", encoding="utf-8"):
             ...
 
-    logger.info("Starting scraping process...")
+    logger.info("Starting async scraping process with curl_cffi...")
+    logger.info(f"Concurrency limits: {MAX_CONCURRENT_DETAILS} details, {MAX_CONCURRENT_AI_REQUESTS} AI requests")
     total_vacancies = 0
 
-    # Create curl_cffi session with browser impersonation
-    with Session(impersonate="chrome") as session:
+    # Create curl_cffi AsyncSession with browser impersonation
+    async with AsyncSession(impersonate="chrome") as session:
         page_number = 0
 
         while True:
             page_number += 1
-            logger.info(f"Scraping page {page_number}...")
+            logger.info(f"\n{'='*60}")
+            logger.info(f"📄 Scraping page {page_number}...")
+            logger.info(f"{'='*60}")
 
-            # Make request with error handling
-            data = get_base_request(session)
+            # Fetch page list
+            data = await get_base_request(session, page_number - 1)
 
-            # Check if we got valid data
             if data is None:
                 logger.error("Failed to fetch data, stopping scraper")
                 break
@@ -319,25 +441,33 @@ def scraping() -> None:
                 logger.info("No more vacancies found, reached the end")
                 break
 
-            # Process vacancy descriptions with rate limiting
+            logger.info(f"Found {len(data)} vacancies on page {page_number}")
+
+            # Fetch all vacancy descriptions concurrently (with limits)
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_DETAILS)
+            rate_limiter = RateLimiter(0.2)  # 0.2s between detail requests (5 req/sec max)
+
+            vacancy_ids = [element["id"] for element in data]
+
+            logger.info(f"Fetching {len(vacancy_ids)} vacancy descriptions (max {MAX_CONCURRENT_DETAILS} concurrent)...")
+            tasks = [
+                get_vacancy_description(session, vid, semaphore, rate_limiter)
+                for vid in vacancy_ids
+            ]
+
+            descriptions_results = await asyncio.gather(*tasks)
+
+            # Build description dict
             raw_stack = {}
-            for idx, element in enumerate(data, 1):
-                inject_vacancy_id_in_payload(element["id"])
-                description = get_vacancy_description(session)
+            for vid, description in descriptions_results:
+                raw_stack[vid] = description if description is not None else ""
 
-                if description:
-                    logger.info(f"{idx} Success to get detail vacancy description, id: {element['id']}")
-                    raw_stack[element["id"]] = description
-                else:
-                    logger.warning(f"Failed to get description for vacancy {element['id']}, skipping")
-                    raw_stack[element["id"]] = ""
+            success_count = sum(1 for _, desc in descriptions_results if desc)
+            logger.info(f"✓ Successfully fetched {success_count}/{len(vacancy_ids)} descriptions")
 
-                # Rate limiting between detail requests (respect the server)
-                if idx < len(data):
-                    time.sleep(0.5)
-
-            # Get AI analysis of tech stacks
-            stacks = get_vacancies_stack(session, raw_stack)
+            # Get AI analysis of tech stacks (async with concurrency control)
+            logger.info(f"Processing with AI ({len(raw_stack)} descriptions in chunks of {config.REQUEST_CHUNK})...")
+            stacks = await get_vacancies_stack(session, raw_stack)
 
             # Attach stacks to vacancy data
             for element in data:
@@ -346,21 +476,25 @@ def scraping() -> None:
             clean_data(data)
             write_csv(data, path)
             total_vacancies += len(data)
-            logger.info(f"Saved {len(data)} vacancies from page {page_number}")
+            logger.info(f"✓ Saved {len(data)} vacancies from page {page_number}")
 
-            # Check if this is the last page (less than expected count)
+            # Check if last page
             if len(data) < config.RESULTS_PER_PAGE:
                 logger.info("Last page reached (partial results)")
                 break
 
-            # Increment page for next iteration
-            get_next_payload()
+            # Rate limiting between pages - be respectful
+            logger.info(f"⏳ Waiting {config.REQUEST_DELAY}s before next page...")
+            await asyncio.sleep(config.REQUEST_DELAY)
 
-            # Rate limiting: be respectful to the server
-            logger.info(f"Waiting {config.REQUEST_DELAY}s before next page request...")
-            time.sleep(config.REQUEST_DELAY)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"✅ Scraping completed! Total vacancies: {total_vacancies}")
+    logger.info(f"{'='*60}")
 
-    logger.info(f"Scraping completed! Total vacancies scraped: {total_vacancies}")
+
+def scraping() -> None:
+    """Synchronous wrapper for async scraping function."""
+    asyncio.run(scraping_async())
 
 
 if __name__ == "__main__":
